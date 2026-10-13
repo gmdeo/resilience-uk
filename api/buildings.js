@@ -20,7 +20,8 @@ module.exports = async (req, res) => {
       ROUND(ST_DISTANCE(geom, ${pt}),1) AS dist_m,
       height,
       num_floors AS floors,
-      class
+      class,
+      ST_ASGEOJSON(ST_SIMPLIFY(geom, 2)) AS gjson
     FROM ${TABLE}
     WHERE ST_DWITHIN(geom, ${pt}, ${radius})
     ORDER BY dist_m ASC

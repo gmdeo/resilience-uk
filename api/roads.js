@@ -14,7 +14,8 @@ module.exports = async (req, res) => {
   const pt = `ST_GEOGPOINT(${lng}, ${lat})`;
   const sql = `
     SELECT geoid, ROUND(ST_DISTANCE(geom, ${pt}),1) AS dist_m, class, subtype,
-      ROUND(ST_Y(ST_CENTROID(geom)),6) AS lat, ROUND(ST_X(ST_CENTROID(geom)),6) AS lon
+      ROUND(ST_Y(ST_CENTROID(geom)),6) AS lat, ROUND(ST_X(ST_CENTROID(geom)),6) AS lon,
+      ST_ASGEOJSON(ST_SIMPLIFY(geom, 2)) AS gjson
     FROM ${TABLE}
     WHERE ST_DWITHIN(geom, ${pt}, ${radius})
     ORDER BY dist_m ASC

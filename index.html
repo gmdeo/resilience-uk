@@ -298,7 +298,6 @@ function initMap(){
   }).addTo(map);
   floodLayerGroup=L.layerGroup().addTo(map);
   map.on('click',e=>setMarker(e.latlng.lat,e.latlng.lng));
-  drawFloodOverlay(UK[0],UK[1],8);
 }
 
 /* ---------- live flood likelihood (Environment Agency RoFRS) ---------- */
@@ -329,7 +328,11 @@ async function queryEA(lat,lng){
   const url="/api/flood?E="+E+"&N="+N+"&pad="+pad;
   try{
     const r=await fetch(url); const j=await r.json();
-    const feats=(j.features||[]);
+    // attach geometry: EA rings [[lng,lat],...] -> Leaflet [[lat,lng],...]
+    const feats=(j.features||[]).map(f=>{
+      if(f.rings&&f.rings.length){ f.geom=f.rings.map(ring=>ring.map(pt=>[pt[1],pt[0]])); }
+      return f;
+    });
     return {ok:j.ok!==false&&feats.length>0,features:feats,source:j.source||"EA live (via proxy)"};
   }catch(e){ return {ok:false,features:[],source:"EA unreachable — modelled estimate"}; }
 }
@@ -547,10 +550,57 @@ function setMarker(lat,lng){
   map.setView([lat,lng],Math.max(map.getZoom(),13));
   $("#coord-chip").textContent=fmt(lat,5)+", "+fmt(lng,5);
   $("#btn-analyse").disabled=false;
+  drawContext(lat,lng); // paint flood zones + footprints + roads immediately
 }
 
-async function drawFloodOverlay(lat,lng,zoom){
-  // lightweight: re-query on analyse, not continuous
+/* ---------- context layer: flood zones + footprints + roads on marker-drop ---------- */
+let CTX=null; // layerGroup of context overlays
+function clearCtx(){ if(CTX){map.removeLayer(CTX);CTX=null;} if(window._bLayer){map.removeLayer(window._bLayer);window._bLayer=null;} if(window._rLayer){map.removeLayer(window._rLayer);window._rLayer=null;} if(window._gspMark){map.removeLayer(window._gspMark);window._gspMark=null;} if(window._gspLine){map.removeLayer(window._gspLine);window._gspLine=null;} }
+function gjLatLngs(gjson){
+  // GeoJSON geometry -> Leaflet latlng arrays (Polygon / MultiPolygon / LineString / MultiLineString)
+  if(!gjson)return null;
+  let g=gjson; if(typeof g==="string"){try{g=JSON.parse(g);}catch(e){return null;}}
+  const f=c=>c.map(pt=>[pt[1],pt[0]]);
+  if(g.type==="Polygon")return g.coordinates.map(f);
+  if(g.type==="MultiPolygon")return g.coordinates.map(poly=>poly.map(f));
+  if(g.type==="LineString")return f(g.coordinates);
+  if(g.type==="MultiLineString")return g.coordinates.map(f);
+  return null;
+}
+async function drawContext(lat,lng){
+  clearCtx();
+  CTX=L.layerGroup().addTo(map);
+  // 1. EA flood likelihood polygons
+  try{
+    const ea=await queryEA(lat,lng);
+    (ea.features||[]).forEach(f=>{
+      if(!f.geom)return;
+      L.polygon(f.geom,{color:floodColor[f.prob_4band]||"#888",weight:1,opacity:0.9,
+        fillColor:floodColor[f.prob_4band]||"#888",fillOpacity:0.30})
+        .addTo(CTX).bindTooltip("Flood: "+(f.prob_4band||"?"));
+    });
+  }catch(e){}
+  // 2. real building footprints
+  try{
+    const b=await fetchBuildings(lat,lng,600);
+    (b&&b.buildings||[]).forEach(bb=>{
+      const ll=gjLatLngs(bb.gjson);
+      if(ll){ L.polygon(ll,{color:"#6b6b5c",weight:0.7,fillColor:"#b9b39e",fillOpacity:0.55}).addTo(CTX); }
+      else if(isFinite(bb.lat)){ L.circleMarker([bb.lat,bb.lon],{radius:2,color:"#8a8a7a",weight:0.5,fillColor:"#c9c4b2",fillOpacity:0.5}).addTo(CTX); }
+    });
+  }catch(e){}
+  // 3. real road network
+  try{
+    const r=await fetchRoads(lat,lng,1500);
+    const art=new Set(["motorway","trunk","primary","secondary"]);
+    (r&&r.roads||[]).forEach(sg=>{
+      const ll=gjLatLngs(sg.gjson);
+      const arterial=art.has(sg.class);
+      if(ll){ L.polyline(ll,{color:arterial?"#b8860b":"#9aa5ad",weight:arterial?2.4:1,opacity:0.75}).addTo(CTX); }
+      else if(isFinite(sg.lat)){ L.circleMarker([sg.lat,sg.lon],{radius:arterial?2.5:1.4,color:arterial?"#b8860b":"#9aa5ad",weight:1,fillOpacity:0.7}).addTo(CTX); }
+    });
+  }catch(e){}
+  CTX.bringToBack();
 }
 
 async function geocode(q){
@@ -641,15 +691,20 @@ function render(opts,hazard,res){
   if(window._bLayer){map.removeLayer(window._bLayer);window._bLayer=null;}
   if(window._rLayer){map.removeLayer(window._rLayer);window._rLayer=null;}
   if(res.bdata&&res.bdata.buildings&&res.bdata.buildings.length){
-    window._bLayer=L.layerGroup(res.bdata.buildings.map(bb=>
-      L.circleMarker([bb.lat,bb.lon],{radius:Math.max(2,Math.sqrt(bb.area_m2||50)/4),color:"#8a8a7a",weight:0.6,fillColor:"#c9c4b2",fillOpacity:0.55})
-    )).addTo(map);
+    window._bLayer=L.layerGroup(res.bdata.buildings.map(bb=>{
+      const ll=gjLatLngs(bb.gjson);
+      if(ll)return L.polygon(ll,{color:"#6b6b5c",weight:0.7,fillColor:"#b9b39e",fillOpacity:0.55});
+      return L.circleMarker([bb.lat,bb.lon],{radius:Math.max(2,Math.sqrt(bb.area_m2||50)/4),color:"#8a8a7a",weight:0.6,fillColor:"#c9c4b2",fillOpacity:0.55});
+    })).addTo(map);
   }
   if(res.road&&res.road.roads&&res.road.roads.length){
     const art=new Set(["motorway","trunk","primary","secondary"]);
-    window._rLayer=L.layerGroup(res.road.roads.map(sg=>
-      L.circleMarker([sg.lat,sg.lon],{radius:art.has(sg.class)?3:1.5,color:art.has(sg.class)?"#b8860b":"#9aa5ad",weight:1,fillOpacity:0.7})
-    )).addTo(map);
+    window._rLayer=L.layerGroup(res.road.roads.map(sg=>{
+      const arterial=art.has(sg.class);
+      const ll=gjLatLngs(sg.gjson);
+      if(ll)return L.polyline(ll,{color:arterial?"#b8860b":"#9aa5ad",weight:arterial?2.4:1,opacity:0.75});
+      return L.circleMarker([sg.lat,sg.lon],{radius:arterial?3:1.5,color:arterial?"#b8860b":"#9aa5ad",weight:1,fillOpacity:0.7});
+    })).addTo(map);
   }
   // draw serving GSP + connection on the map
   if(window._gspMark){map.removeLayer(window._gspMark);window._gspMark=null;}

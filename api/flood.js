@@ -19,13 +19,18 @@ module.exports = async (req, res) => {
   const url = EA_BASE +
     "?where=1%3D1&geometry=" + encodeURIComponent(geometry) +
     "&geometryType=esriGeometryEnvelope&inSR=27700&spatialRel=esriSpatialRelIntersects" +
-    "&outFields=prob_4band,suitability&returnGeometry=false&f=json";
+    "&outFields=prob_4band,suitability&returnGeometry=true&outSR=4326&f=json";
 
   try {
     const upstream = await fetch(url, { headers: { "User-Agent": "ResilienceUK/1.0" } });
     const data = await upstream.json();
+    const feats = (data.features || []).map(f => ({
+      prob_4band: f.attributes && f.attributes.prob_4band,
+      suitability: f.attributes && f.attributes.suitability,
+      rings: f.geometry && f.geometry.rings ? f.geometry.rings : null
+    }));
     res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate");
-    res.status(200).json({ ok: true, source: "EA live (via proxy)", count: (data.features || []).length, features: (data.features || []).map(f => f.attributes) });
+    res.status(200).json({ ok: true, source: "EA live (via proxy)", count: feats.length, features: feats });
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e), features: [] });
   }
