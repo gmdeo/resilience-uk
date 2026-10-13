@@ -566,7 +566,7 @@ async function analyse(){
   $("#results").classList.add("show");
   $("#cp-body").innerHTML='<div class="cp-thinking"><span></span><span></span><span></span></div>';
   // 1. live hazard + real grid + real buildings + real roads in parallel
-  const [ea, bdata, rdata]=await Promise.all([
+  const [ea, , bdata, rdata]=await Promise.all([
     queryEA(SEL.lat,SEL.lng), loadGSP(),
     fetchBuildings(SEL.lat,SEL.lng,1000), fetchRoads(SEL.lat,SEL.lng,3000)
   ]);
