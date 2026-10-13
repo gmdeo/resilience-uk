@@ -245,6 +245,9 @@ footer.src a{color:var(--thames);text-decoration:none}
           </div>
         </div>
 
+        <div class="section-t">Network connectivity <span style="font-size:10px;font-weight:400;color:var(--slate)">· real grid position</span></div>
+        <div class="card"><div id="grid-lines"></div></div>
+
         <div class="section-t">Dependency breakdown</div>
         <div class="card"><div id="dep-list"></div></div>
 
@@ -258,7 +261,7 @@ footer.src a{color:var(--thames);text-decoration:none}
         </div>
 
         <footer class="src">
-          Hazard likelihood: <a href="https://environment.data.gov.uk/" target="_blank" rel="noopener">Environment Agency — Risk of Flooding from Rivers &amp; Sea</a> (live query). Grid &amp; network context: National Grid ESO open data. Geocoding: Nominatim / OSM. Engine: recovery-curve downtime model (conditional mean + σ over return-period set), score bins mean+2σ → High ≥7d · Med 2–7d · Low &lt;2d. Independent re-implementation for research; not affiliated with One Concern.
+          Hazard likelihood: <a href="https://environment.data.gov.uk/" target="_blank" rel="noopener">Environment Agency — Risk of Flooding from Rivers &amp; Sea</a> (live query). Grid network: <a href="https://www.neso.energy/data-portal" target="_blank" rel="noopener">National Grid ESO (NESO)</a> — real Grid Supply Point locations, voltage-tier cascade + shared-corridor outage correlation. Geocoding: Nominatim / OSM. Engine: recovery-curve downtime model (conditional mean + σ over return-period set), score bins mean+2σ → High ≥7d · Med 2–7d · Low &lt;2d. Independent re-implementation for research; not affiliated with One Concern.
         </footer>
       </div>
     </aside>
@@ -337,6 +340,28 @@ function summarizeFlood(feats){
   return {band:worst,weight:w,count:feats.length};
 }
 
+/* ---------- REAL GRID: NESO Grid Supply Points (live, CORS-open) ---------- */
+let GSP=null; // cached array of {id,name,lat,lon}
+async function loadGSP(){
+  if(GSP)return GSP;
+  const direct="https://api.neso.energy/api/3/action/datastore_search?resource_id=000d08b9-12d9-4396-95f8-6b3677664836&limit=500";
+  const norm=recs=>recs.map(x=>({id:x["GSP ID"],name:x.Name,group:x["GSP Group"],lat:parseFloat(x.Latitude),lon:parseFloat(x.Longitude)})).filter(p=>isFinite(p.lat)&&isFinite(p.lon));
+  try{ // direct first (CORS-open)
+    const r=await fetch(direct); const j=await r.json(); GSP=norm(j.result.records||[]); GSP._source="NESO live";
+  }catch(e){
+    try{ const r2=await fetch("/api/gsp"); const j2=await r2.json(); GSP=j2.points||[]; GSP._source="NESO (via proxy)"; }
+    catch(e2){ GSP=[]; GSP._source="grid unavailable — estimated"; }
+  }
+  return GSP;
+}
+const havKm=(a,b,c,d)=>{const R=6371,toR=x=>x*Math.PI/180;const dLa=toR(c-a),dLo=toR(d-b);const h=Math.sin(dLa/2)**2+Math.cos(toR(a))*Math.cos(toR(c))*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(h));};
+function nearestGSP(lat,lng){
+  if(!GSP||!GSP.length)return null;
+  let best=null,bd=1e9;
+  for(const g of GSP){const d=havKm(lat,lng,g.lat,g.lon); if(d<bd){bd=d;best=g;}}
+  return {gsp:best,distKm:round2(best?bd:0)};
+}
+
 /* ---------- GEO: building profile + local dependency graph ---------- */
 function deriveBuilding(lat,lng){
   const rng=mulberry32(hashStr(lat.toFixed(4)+","+lng.toFixed(4)));
@@ -354,16 +379,42 @@ function deriveBuilding(lat,lng){
           frailty:c.frailty*(0.85+rng()*0.3), recoverability:c.rec, distToSubstation:Math.round(120+rng()*1600), distToArterial:Math.round(60+rng()*900)};
 }
 
-/* Dependency/lifeline engine — expected days out per dependency given hazard */
-function computeDependencies(lat,lng,hazardWeight,peril,rp,b){
+/* Dependency/lifeline engine — expected days out per dependency given hazard.
+   Power downtime now uses REAL network position: distance to the nearest NESO
+   Grid Supply Point, and whether that GSP sits inside the same flood hazard band
+   (shared-corridor correlated outage — the core "outside-the-fence" insight). */
+function computeDependencies(lat,lng,hazardWeight,peril,rp,b,gridInfo){
   const rng=mulberry32(hashStr("dep"+lat.toFixed(3)+lng.toFixed(3)+peril));
   const rpFactor=Math.log10(rp/10+1)/Math.log10(101); // 0.5 @50y → 1.0 @1000y
   const base=hazardWeight*(0.6+rpFactor)*b.frailty;
-  const gridNear=clamp(1.6-(b.distToSubstation/1800),0.35,1.6);   // closer substation => more correlated outage
-  const roadNear=clamp(1.4-(b.distToArterial/1100),0.3,1.4);
   const j=()=>0.75+rng()*0.5;
+
+  // --- power: true network cascade --------------------------------------
+  // gridInfo = {distKm, gspInHazard, gsp:{name,group}}
+  let utilDays;
+  if(gridInfo && isFinite(gridInfo.distKm)){
+    const distKm=gridInfo.distKm;
+    // tiered restoration: 400/275kV ~1d, 132kV ~2-4d, 33kV ~5-8d, 11kV/LV ~7-14d.
+    // distance-to-GSP proxies the distribution tier an address hangs off.
+    let tierRestore, tier;
+    if(distKm<=5){tier="132kV primary";tierRestore=2.6;}
+    else if(distKm<=12){tier="33kV";tierRestore=5.4;}
+    else if(distKm<=30){tier="11kV";tierRestore=8.2;}
+    else {tier="LV / remote feeder";tierRestore=11.5;}
+    // correlated outage: the serving GSP itself is in the same hazard band
+    const correlated=gridInfo.gspInHazard?1.55:1.0;
+    utilDays=round2(base* tierRestore * correlated * j());
+    gridInfo.tier=tier; gridInfo.correlated=correlated;
+  }else{
+    // fallback to the older distance heuristic if GSP unavailable
+    const gridNear=clamp(1.6-(b.distToSubstation/1800),0.35,1.6);
+    utilDays=round2(base* 9.5*gridNear*j());
+    if(gridInfo){gridInfo.tier="estimated";gridInfo.correlated=1.0;}
+  }
+
+  const roadNear=clamp(1.4-(b.distToArterial/1100),0.3,1.4);
   const days={
-    utility:      round2(base* 9.5*gridNear*j()),
+    utility:      utilDays,
     ingress_egress:round2(base* 5.2*roadNear*j()),
     community:    round2(base* 3.4*j()),
     repair_time:  round2(base* 7.0*(2-b.recoverability)*j())
@@ -373,9 +424,9 @@ function computeDependencies(lat,lng,hazardWeight,peril,rp,b){
 const DEP_WEIGHTS={utility:0.40,ingress_egress:0.25,community:0.15,repair_time:0.20};
 
 /* ---------- Downtime statistic (recovery-curve → conditional mean/σ) ---------- */
-function computeDowntime(lat,lng,opts,hazard){
+function computeDowntime(lat,lng,opts,hazard,gridInfo){
   const b=deriveBuilding(lat,lng);
-  const dep=computeDependencies(lat,lng,hazard.weight,opts.peril,opts.return_period_yrs,b);
+  const dep=computeDependencies(lat,lng,hazard.weight,opts.peril,opts.return_period_yrs,b,gridInfo);
   // recovery curves: for each dependency, mean + dispersion across the RP set
   let mean, stdev;
   const vals=Object.values(dep);
@@ -419,13 +470,13 @@ function firstFail(dep){
 
 /* ---------- co-pilot (deterministic analyst) ---------- */
 function copilotBrief(lat,lng,opts,hazard,res){
-  const b=res.building, score=res.score.toUpperCase();
+  const b=res.building, score=res.score.toUpperCase(), g=res.grid||{};
   const drivers=Object.keys(res.dep).sort((x,y)=>res.dep[y]-res.dep[x]);
   const top=drivers[0], second=drivers[1];
   const dname={utility:"grid dependency (power distribution)",ingress_egress:"access dependency (road / ingress-egress)",community:"community dependency",repair_time:"structural repair timeline"};
   const uplift=opts.climate_change==="cc2050_45"?" The 2050 RCP-4.5 scenario adds ~18% to expected downtime, shifting marginal assets across the Medium threshold.":"";
   const mit={
-    utility:["Install on-site generation / UPS sized to the expected "+fmt(res.dep.utility,1)+"-day grid outage window","Negotiate priority-restore status with the local DNO for this feeder","Relocate critical electrical plant above the modelled flood level"],
+    utility:[(g.gsp?`Install on-site generation / UPS sized to the ${fmt(res.dep.utility,1)}-day outage window on the ${g.gsp.name} GSP (${g.tier})`:"Install on-site generation / UPS sized to the expected "+fmt(res.dep.utility,1)+"-day grid outage window"),(g.gspInHazard?"Demand N-connection / alternative supply path — the serving GSP is itself flood-exposed":"Negotiate priority-restore status with the local DNO for this feeder"),"Relocate critical electrical plant above the modelled flood level"],
     ingress_egress:["Establish a secondary logistics route independent of the vulnerable arterial","Hold "+Math.ceil(res.dep.ingress_egress+1)+" days of buffer stock through the peak season","Pre-contract emergency access / amphibious logistics for the isolation window"],
     community:["Cross-train staff for remote operation through the community-recovery window","Identify alternative premises within the same utility cell but outside the flood likelihood band"],
     repair_time:["Pre-agree a framework contract with a restoration contractor to cut reoccupation time","Retrofit flood-resilient materials to ground-floor fabric (recoverability currently "+fmt(b.recoverability,2)+")"]
@@ -435,11 +486,14 @@ function copilotBrief(lat,lng,opts,hazard,res){
     :res.score==="med"
     ?"At MEDIUM downtime risk, mitigation ROI is strongest: reducing the dominant dependency below the 2-day low threshold drops the score and the corresponding BI premium."
     :"At LOW downtime risk, retain the risk. Standard cover is likely adequate; monitor the dependency profile for climate drift.";
+  const gridSentence=g.gsp
+    ?`The asset is served by the <strong>${g.gsp.name}</strong> Grid Supply Point (${g.distKm} km, ${g.tier} tier) per NESO network data${g.gspInHazard?` — and critically, that GSP itself sits inside a <strong>${g.gspBand}</strong> flood-likelihood band, so the building and its power supply flood <em>together</em>. That shared-corridor correlation is what pushes power downtime to ${fmt(res.dep.utility,1)} days.`:". That GSP sits outside the mapped flood band, so supply failure is less correlated with a local event."}`
+    :"Grid position estimated (network data unavailable).";
   return `
     <h5>Resilience brief — ${opts.peril}, ${opts.return_period_yrs}-yr</h5>
     <p>This ${b.type} asset (${b.floorArea.toLocaleString()} m²) carries a <strong>${score}</strong> business-interruption score: an expected <strong>${fmt(res.mean,1)} days</strong> of downtime (σ ${fmt(res.stdev,1)}), binned at mean+2σ = ${fmt(res.bin,1)} days. The dominant driver is <strong>${dname[top]}</strong> at ${fmt(res.dep[top],1)} days, followed by ${dname[second]} at ${fmt(res.dep[second],1)} days.${uplift}</p>
     <h5>Why it's not the building</h5>
-    <p>Flood likelihood here is <strong>${hazard.band}</strong>. Yet downtime concentrates in the <em>dependency</em>, not the parcel: the asset sits ~${b.distToSubstation} m from its serving substation and ~${b.distToArterial} m from the nearest arterial. It fails when those fail — often before water reaches the door.</p>
+    <p>Flood likelihood here is <strong>${hazard.band}</strong>. Yet downtime concentrates in the <em>dependency</em>, not the parcel. ${gridSentence} It fails when the network fails — often before water reaches the door.</p>
     <h5>Mitigation (highest ROI first)</h5>
     <ul>${mit[top].map(m=>`<li>${m}</li>`).join("")}</ul>
     <h5>Risk transfer</h5>
@@ -474,15 +528,29 @@ async function analyse(){
               return_period_yrs:+$("#return_period_yrs").value,climate_change:$("#climate_change").value};
   $("#results").classList.add("show");
   $("#cp-body").innerHTML='<div class="cp-thinking"><span></span><span></span><span></span></div>';
-  // 1. live hazard
-  const ea=await queryEA(SEL.lat,SEL.lng);
+  // 1. live hazard + real grid in parallel
+  const [ea]=await Promise.all([queryEA(SEL.lat,SEL.lng), loadGSP()]);
   const hazard=summarizeFlood(ea.features); hazard.source=ea.source;
   // non-flood perils carry their own baseline weight (UK wind/seismic low background)
   if(opts.peril==="wind"&&hazard.weight<0.2)hazard.weight=0.22,hazard.band="wind-exposed (modelled)";
   if(opts.peril==="seismic"&&hazard.weight<0.12)hazard.weight=0.12,hazard.band="low seismic (UK background)";
   if(opts.peril==="integrated")hazard.weight=clamp(hazard.weight+0.15,0.05,1.0);
-  // 2. downtime engine
-  const res=computeDowntime(SEL.lat,SEL.lng,opts,hazard);
+
+  // 2. real network connectivity: nearest GSP + is it in the same hazard band?
+  let gridInfo={tier:"estimated",correlated:1.0,gsp:null,distKm:NaN,gspInHazard:false,source:GSP._source};
+  const ng=nearestGSP(SEL.lat,SEL.lng);
+  if(ng){
+    gridInfo.distKm=ng.distKm; gridInfo.gsp=ng.gsp;
+    // is the GSP itself inside a mapped flood-risk cell? (shared-corridor outage)
+    const gq=await queryEA(ng.gsp.lat,ng.gsp.lon);
+    const gs=summarizeFlood(gq.features);
+    gridInfo.gspInHazard=["High","Medium"].includes(gs.band);
+    gridInfo.gspBand=gs.band;
+  }
+
+  // 3. downtime engine
+  const res=computeDowntime(SEL.lat,SEL.lng,opts,hazard,gridInfo);
+  res.grid=gridInfo;
   render(opts,hazard,res);
 }
 
@@ -493,18 +561,36 @@ function render(opts,hazard,res){
   $("#downtime-big").textContent=fmt(res.mean,1);
   $("#verdict-meta").textContent="mean "+fmt(res.mean,1)+"d · σ "+fmt(res.stdev,1)+"d · binned mean+2σ = "+fmt(res.bin,1)+"d → "+res.score+" · building "+res.building.uuid;
   $("#hazard-lines").innerHTML=hazardLines(hazard,opts.peril,opts.return_period_yrs);
-  const b=res.building;
+  const b=res.building, g=res.grid||{};
   $("#building-lines").innerHTML=[
     ["Type",b.type],["Floor area",b.floorArea.toLocaleString()+" m²"],
-    ["→ substation",b.distToSubstation+" m"],["→ arterial",b.distToArterial+" m"],
     ["Fragility idx",fmt(b.frailty,2)],["Recoverability",fmt(b.recoverability,2)]
   ].map(r=>`<div class="mline"><span class="k">${r[0]}</span><span class="v">${r[1]}</span></div>`).join("");
+  // real network connectivity card
+  const gspLine = g.gsp
+    ? `<div class="mline"><span class="k">Serving GSP</span><span class="v">${g.gsp.name} (${g.gsp.group})</span></div>
+       <div class="mline"><span class="k">Distance</span><span class="v">${g.distKm} km</span></div>
+       <div class="mline"><span class="k">Network tier</span><span class="v">${g.tier}</span></div>
+       <div class="mline"><span class="k">GSP flood band</span><span class="v">${g.gspBand||"—"}</span></div>
+       <div class="mline"><span class="k">Correlated outage</span><span class="v" style="color:${g.gspInHazard?"var(--alert)":"var(--ok)"}">${g.gspInHazard?"YES — shared corridor":"no"}</span></div>`
+    : `<div class="mline"><span class="k">Grid</span><span class="v">estimated (${g.source||"unavailable"})</span></div>`;
+  $("#grid-lines").innerHTML = gspLine +
+    `<div class="mline"><span class="k">Grid source</span><span class="v" style="font-size:10px">${g.source||"—"}</span></div>`;
   // dependency bars
   const maxd=Math.max(...Object.values(res.dep),0.1);
   const dcolor=d=>d>=7?"#c0392b":d>=2?"#b8860b":"#2e7d4f";
   $("#dep-list").innerHTML=Object.keys(res.dep).sort((a,b)=>res.dep[b]-res.dep[a]).map(k=>
     `<div class="dep-row"><span class="dep-name">${k.replace("_"," ")}</span><div class="dep-bar"><div class="dep-fill" style="width:${(res.dep[k]/maxd*100)}%;background:${dcolor(res.dep[k])}"></div></div><span class="dep-days">${fmt(res.dep[k],1)} d</span></div>`).join("");
   $("#first-fail").innerHTML=firstFail(res.dep);
+  // draw serving GSP + connection on the map
+  if(window._gspMark){map.removeLayer(window._gspMark);window._gspMark=null;}
+  if(window._gspLine){map.removeLayer(window._gspLine);window._gspLine=null;}
+  if(res.grid&&res.grid.gsp){
+    const gl=[res.grid.gsp.lat,res.grid.gsp.lon];
+    window._gspMark=L.circleMarker(gl,{radius:7,color:"#8e44ad",weight:2,fillColor:"#8e44ad",fillOpacity:0.7})
+      .addTo(map).bindTooltip("GSP: "+res.grid.gsp.name+" ("+res.grid.distKm+" km)",{permanent:false});
+    window._gspLine=L.polyline([[SEL.lat,SEL.lng],gl],{color:"#8e44ad",weight:2,dashArray:"6 6",opacity:0.8}).addTo(map);
+  }
   // copilot (staged reveal)
   const brief=copilotBrief(SEL.lat,SEL.lng,opts,hazard,res);
   setTimeout(()=>{ $("#cp-body").innerHTML=brief; },900);
