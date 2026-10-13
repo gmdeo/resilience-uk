@@ -245,6 +245,9 @@ footer.src a{color:var(--thames);text-decoration:none}
           </div>
         </div>
 
+        <div class="section-t">Built environment &amp; access <span style="font-size:10px;font-weight:400;color:var(--slate)">· real footprints + roads</span></div>
+        <div class="card"><div id="built-lines"></div></div>
+
         <div class="section-t">Network connectivity <span style="font-size:10px;font-weight:400;color:var(--slate)">· real grid position</span></div>
         <div class="card"><div id="grid-lines"></div></div>
 
@@ -261,7 +264,7 @@ footer.src a{color:var(--thames);text-decoration:none}
         </div>
 
         <footer class="src">
-          Hazard likelihood: <a href="https://environment.data.gov.uk/" target="_blank" rel="noopener">Environment Agency — Risk of Flooding from Rivers &amp; Sea</a> (live query). Grid network: <a href="https://www.neso.energy/data-portal" target="_blank" rel="noopener">National Grid ESO (NESO)</a> — real Grid Supply Point locations, voltage-tier cascade + shared-corridor outage correlation. Geocoding: Nominatim / OSM. Engine: recovery-curve downtime model (conditional mean + σ over return-period set), score bins mean+2σ → High ≥7d · Med 2–7d · Low &lt;2d. Independent re-implementation for research; not affiliated with One Concern.
+          Hazard likelihood: <a href="https://environment.data.gov.uk/" target="_blank" rel="noopener">Environment Agency — Risk of Flooding from Rivers &amp; Sea</a> (live). Grid network: <a href="https://www.neso.energy/data-portal" target="_blank" rel="noopener">National Grid ESO (NESO)</a> — real Grid Supply Points, voltage-tier cascade + shared-corridor outage. Built environment &amp; roads: <a href="https://carto.com" target="_blank" rel="noopener">CARTO</a> · <a href="https://overturemaps.org" target="_blank" rel="noopener">Overture Maps</a> real footprints + road segments. Geocoding: Nominatim / OSM. Engine: recovery-curve downtime model (conditional mean + σ over return-period set), score bins mean+2σ → High ≥7d · Med 2–7d · Low &lt;2d. Independent re-implementation for research; not affiliated with One Concern.
         </footer>
       </div>
     </aside>
@@ -362,28 +365,48 @@ function nearestGSP(lat,lng){
   return {gsp:best,distKm:round2(best?bd:0)};
 }
 
-/* ---------- GEO: building profile + local dependency graph ---------- */
-function deriveBuilding(lat,lng){
+/* ---------- GEO: building profile (REAL footprints via CARTO/Overture) ---------- */
+async function fetchBuildings(lat,lng,radius){
+  try{
+    const r=await fetch(`/api/buildings?lat=${lat}&lng=${lng}&radius=${radius||1000}`);
+    const j=await r.json(); return j.ok?j:null;
+  }catch(e){ return null; }
+}
+async function fetchRoads(lat,lng,radius){
+  try{
+    const r=await fetch(`/api/roads?lat=${lat}&lng=${lng}&radius=${radius||3000}`);
+    const j=await r.json(); return j.ok?j:null;
+  }catch(e){ return null; }
+}
+// Classify the asset the user clicked on from real building data, else modelled fallback
+function deriveBuilding(lat,lng,bdata){
   const rng=mulberry32(hashStr(lat.toFixed(4)+","+lng.toFixed(4)));
-  const types=[
-    {t:"commercial office",area:850,occ:0.9,frailty:0.9,rec:1.0},
-    {t:"retail / high-street",area:220,occ:0.95,frailty:1.15,rec:1.1},
-    {t:"light industrial",area:1400,occ:0.8,frailty:1.0,rec:0.95},
-    {t:"logistics / warehouse",area:3200,occ:0.7,frailty:0.85,rec:0.85},
-    {t:"residential block",area:420,occ:0.6,frailty:0.8,rec:0.75},
-    {t:"civic / healthcare",area:980,occ:1.0,frailty:0.7,rec:0.7}
-  ];
-  const c=types[Math.floor(rng()*types.length)];
-  const uuid="uk-"+hashStr(lat+"|"+lng).toString(16).padStart(8,"0")+"-"+String(Math.floor(rng()*0xffff)).padStart(4,"0");
-  return {uuid, type:c.t, floorArea:Math.round(c.area*(0.7+rng()*0.8)), occupancy:c.occ,
-          frailty:c.frailty*(0.85+rng()*0.3), recoverability:c.rec, distToSubstation:Math.round(120+rng()*1600), distToArterial:Math.round(60+rng()*900)};
+  if(bdata && bdata.buildings && bdata.buildings.length){
+    // nearest real building to the click
+    const nb=bdata.buildings[0];
+    const cls=(nb.class||"").toLowerCase();
+    let type="building", frailty=0.95, rec=0.95;
+    if(/retail|shop|commercial/.test(cls)){type="retail / commercial";frailty=1.1;rec=1.05;}
+    else if(/industrial|warehouse|manufactur/.test(cls)){type="industrial / logistics";frailty=0.95;rec=0.9;}
+    else if(/residential|house|apartment/.test(cls)){type="residential";frailty=0.85;rec=0.8;}
+    else if(/civic|hospital|school|public/.test(cls)){type="civic / healthcare";frailty=0.75;rec=0.75;}
+    const area=Math.max(40,Math.round(nb.area_m2||bdata.stats.meanArea||300));
+    const floors=nb.floors||Math.max(1,Math.round((nb.height||6)/3.2));
+    return {uuid:"ovr-"+String(nb.geoid||hashStr(lat+lng)).slice(0,12), type, floorArea:area, floors,
+            occupancy:0.85, frailty, recoverability:rec, real:true, buildingCount:bdata.stats.count, density:bdata.stats.density};
+  }
+  // fallback: modelled (data unavailable)
+  const c=[{t:"commercial office",area:850,f:0.9,r:1.0},{t:"retail / high-street",area:220,f:1.15,r:1.1},{t:"light industrial",area:1400,f:1.0,r:0.95},{t:"residential block",area:420,f:0.8,r:0.75}][Math.floor(rng()*4)];
+  const uuid="uk-"+hashStr(lat+"|"+lng).toString(16).padStart(8,"0");
+  return {uuid, type:c.t, floorArea:Math.round(c.area*(0.7+rng()*0.8)), occupancy:0.85,
+          frailty:c.f*(0.85+rng()*0.3), recoverability:c.r, real:false};
 }
 
 /* Dependency/lifeline engine — expected days out per dependency given hazard.
    Power downtime now uses REAL network position: distance to the nearest NESO
    Grid Supply Point, and whether that GSP sits inside the same flood hazard band
    (shared-corridor correlated outage — the core "outside-the-fence" insight). */
-function computeDependencies(lat,lng,hazardWeight,peril,rp,b,gridInfo){
+function computeDependencies(lat,lng,hazardWeight,peril,rp,b,gridInfo,roadInfo){
   const rng=mulberry32(hashStr("dep"+lat.toFixed(3)+lng.toFixed(3)+peril));
   const rpFactor=Math.log10(rp/10+1)/Math.log10(101); // 0.5 @50y → 1.0 @1000y
   const base=hazardWeight*(0.6+rpFactor)*b.frailty;
@@ -412,7 +435,17 @@ function computeDependencies(lat,lng,hazardWeight,peril,rp,b,gridInfo){
     if(gridInfo){gridInfo.tier="estimated";gridInfo.correlated=1.0;}
   }
 
-  const roadNear=clamp(1.4-(b.distToArterial/1100),0.3,1.4);
+  // --- ingress/egress: real road connectivity (distance to arterial) --------
+  let roadNear;
+  if(roadInfo && roadInfo.nearestArterial){
+    const dArt=roadInfo.nearestArterial.dist_m;             // metres to nearest arterial
+    // closer arterial = more likely to flood/close with the area; isolated = worse access
+    roadNear=clamp(1.5-(dArt/1200),0.35,1.5);
+    roadInfo.distToArterial=Math.round(dArt);
+  }else{
+    roadNear=clamp(1.4-((b.distToArterial||500)/1100),0.3,1.4);
+    if(roadInfo)roadInfo.distToArterial=b.distToArterial||null;
+  }
   const days={
     utility:      utilDays,
     ingress_egress:round2(base* 5.2*roadNear*j()),
@@ -424,9 +457,8 @@ function computeDependencies(lat,lng,hazardWeight,peril,rp,b,gridInfo){
 const DEP_WEIGHTS={utility:0.40,ingress_egress:0.25,community:0.15,repair_time:0.20};
 
 /* ---------- Downtime statistic (recovery-curve → conditional mean/σ) ---------- */
-function computeDowntime(lat,lng,opts,hazard,gridInfo){
-  const b=deriveBuilding(lat,lng);
-  const dep=computeDependencies(lat,lng,hazard.weight,opts.peril,opts.return_period_yrs,b,gridInfo);
+function computeDowntime(lat,lng,opts,hazard,gridInfo,b,roadInfo){
+  const dep=computeDependencies(lat,lng,hazard.weight,opts.peril,opts.return_period_yrs,b,gridInfo,roadInfo);
   // recovery curves: for each dependency, mean + dispersion across the RP set
   let mean, stdev;
   const vals=Object.values(dep);
@@ -489,11 +521,16 @@ function copilotBrief(lat,lng,opts,hazard,res){
   const gridSentence=g.gsp
     ?`The asset is served by the <strong>${g.gsp.name}</strong> Grid Supply Point (${g.distKm} km, ${g.tier} tier) per NESO network data${g.gspInHazard?` — and critically, that GSP itself sits inside a <strong>${g.gspBand}</strong> flood-likelihood band, so the building and its power supply flood <em>together</em>. That shared-corridor correlation is what pushes power downtime to ${fmt(res.dep.utility,1)} days.`:". That GSP sits outside the mapped flood band, so supply failure is less correlated with a local event."}`
     :"Grid position estimated (network data unavailable).";
+  const rd=res.road||{};
+  const accessSentence=rd.nearestArterial
+    ?`Access runs on the real road graph: the nearest arterial is ${rd.distToArterial} m away (${rd.nearestArterial.class||"arterial"}), with ${rd.roadDensity} road segments/km² of local connectivity.`
+    :"Road access estimated (network data unavailable).";
+  const bSrc=b.real?`a real Overture Maps footprint — ${b.floorArea.toLocaleString()} m², ${b.floors||"—"} floor(s), one of ${b.buildingCount} buildings within 1 km`:`a modelled ${b.type} (${b.floorArea.toLocaleString()} m²)`;
   return `
     <h5>Resilience brief — ${opts.peril}, ${opts.return_period_yrs}-yr</h5>
-    <p>This ${b.type} asset (${b.floorArea.toLocaleString()} m²) carries a <strong>${score}</strong> business-interruption score: an expected <strong>${fmt(res.mean,1)} days</strong> of downtime (σ ${fmt(res.stdev,1)}), binned at mean+2σ = ${fmt(res.bin,1)} days. The dominant driver is <strong>${dname[top]}</strong> at ${fmt(res.dep[top],1)} days, followed by ${dname[second]} at ${fmt(res.dep[second],1)} days.${uplift}</p>
+    <p>This asset is ${bSrc}, and carries a <strong>${score}</strong> business-interruption score: an expected <strong>${fmt(res.mean,1)} days</strong> of downtime (σ ${fmt(res.stdev,1)}), binned at mean+2σ = ${fmt(res.bin,1)} days. The dominant driver is <strong>${dname[top]}</strong> at ${fmt(res.dep[top],1)} days, followed by ${dname[second]} at ${fmt(res.dep[second],1)} days.${uplift}</p>
     <h5>Why it's not the building</h5>
-    <p>Flood likelihood here is <strong>${hazard.band}</strong>. Yet downtime concentrates in the <em>dependency</em>, not the parcel. ${gridSentence} It fails when the network fails — often before water reaches the door.</p>
+    <p>Flood likelihood here is <strong>${hazard.band}</strong>. Yet downtime concentrates in the <em>dependency</em>, not the parcel. ${gridSentence} ${accessSentence} It fails when the network fails — often before water reaches the door.</p>
     <h5>Mitigation (highest ROI first)</h5>
     <ul>${mit[top].map(m=>`<li>${m}</li>`).join("")}</ul>
     <h5>Risk transfer</h5>
@@ -528,8 +565,11 @@ async function analyse(){
               return_period_yrs:+$("#return_period_yrs").value,climate_change:$("#climate_change").value};
   $("#results").classList.add("show");
   $("#cp-body").innerHTML='<div class="cp-thinking"><span></span><span></span><span></span></div>';
-  // 1. live hazard + real grid in parallel
-  const [ea]=await Promise.all([queryEA(SEL.lat,SEL.lng), loadGSP()]);
+  // 1. live hazard + real grid + real buildings + real roads in parallel
+  const [ea, bdata, rdata]=await Promise.all([
+    queryEA(SEL.lat,SEL.lng), loadGSP(),
+    fetchBuildings(SEL.lat,SEL.lng,1000), fetchRoads(SEL.lat,SEL.lng,3000)
+  ]);
   const hazard=summarizeFlood(ea.features); hazard.source=ea.source;
   // non-flood perils carry their own baseline weight (UK wind/seismic low background)
   if(opts.peril==="wind"&&hazard.weight<0.2)hazard.weight=0.22,hazard.band="wind-exposed (modelled)";
@@ -548,9 +588,13 @@ async function analyse(){
     gridInfo.gspBand=gs.band;
   }
 
-  // 3. downtime engine
-  const res=computeDowntime(SEL.lat,SEL.lng,opts,hazard,gridInfo);
-  res.grid=gridInfo;
+  // 3. real building + road context
+  const b=deriveBuilding(SEL.lat,SEL.lng,bdata);
+  const roadInfo=rdata||{distToArterial:null,nearestArterial:null,roadDensity:0,nearestRoad:null};
+
+  // 4. downtime engine
+  const res=computeDowntime(SEL.lat,SEL.lng,opts,hazard,gridInfo,b,roadInfo);
+  res.grid=gridInfo; res.road=roadInfo; res.bdata=bdata;
   render(opts,hazard,res);
 }
 
@@ -561,10 +605,21 @@ function render(opts,hazard,res){
   $("#downtime-big").textContent=fmt(res.mean,1);
   $("#verdict-meta").textContent="mean "+fmt(res.mean,1)+"d · σ "+fmt(res.stdev,1)+"d · binned mean+2σ = "+fmt(res.bin,1)+"d → "+res.score+" · building "+res.building.uuid;
   $("#hazard-lines").innerHTML=hazardLines(hazard,opts.peril,opts.return_period_yrs);
-  const b=res.building, g=res.grid||{};
+  const b=res.building, g=res.grid||{}, rd=res.road||{};
+  const bSrc = b.real?`<span style="color:var(--ok)">Overture footprint</span>`:`<span style="color:var(--amber)">modelled</span>`;
   $("#building-lines").innerHTML=[
-    ["Type",b.type],["Floor area",b.floorArea.toLocaleString()+" m²"],
-    ["Fragility idx",fmt(b.frailty,2)],["Recoverability",fmt(b.recoverability,2)]
+    ["Asset type",b.type],["Source",bSrc],["Floor area",b.floorArea.toLocaleString()+" m²"],
+    ["Floors",b.floors||"—"],["Fragility idx",fmt(b.frailty,2)],["Recoverability",fmt(b.recoverability,2)]
+  ].map(r=>`<div class="mline"><span class="k">${r[0]}</span><span class="v">${r[1]}</span></div>`).join("");
+  // built environment + road connectivity card
+  const rdArt = rd.distToArterial!=null? rd.distToArterial+" m" : "—";
+  $("#built-lines").innerHTML=[
+    ["Buildings (1 km)", b.buildingCount!=null?b.buildingCount:"—"],
+    ["Building density", b.density!=null?b.density+" /km²-scaled":"—"],
+    ["Nearest road", rd.nearestRoad?Math.round(rd.nearestRoad.dist_m)+" m ("+(rd.nearestRoad.class||"road")+")":"—"],
+    ["Nearest arterial", rdArt+(rd.nearestArterial?" ("+(rd.nearestArterial.class||"")+")":"")],
+    ["Road density", rd.roadDensity!=null?rd.roadDensity+" seg/km²":"—"],
+    ["Road source", rd.nearestRoad?"CARTO · Overture":"estimated"]
   ].map(r=>`<div class="mline"><span class="k">${r[0]}</span><span class="v">${r[1]}</span></div>`).join("");
   // real network connectivity card
   const gspLine = g.gsp
@@ -582,6 +637,20 @@ function render(opts,hazard,res){
   $("#dep-list").innerHTML=Object.keys(res.dep).sort((a,b)=>res.dep[b]-res.dep[a]).map(k=>
     `<div class="dep-row"><span class="dep-name">${k.replace("_"," ")}</span><div class="dep-bar"><div class="dep-fill" style="width:${(res.dep[k]/maxd*100)}%;background:${dcolor(res.dep[k])}"></div></div><span class="dep-days">${fmt(res.dep[k],1)} d</span></div>`).join("");
   $("#first-fail").innerHTML=firstFail(res.dep);
+  // draw real building footprints + roads
+  if(window._bLayer){map.removeLayer(window._bLayer);window._bLayer=null;}
+  if(window._rLayer){map.removeLayer(window._rLayer);window._rLayer=null;}
+  if(res.bdata&&res.bdata.buildings&&res.bdata.buildings.length){
+    window._bLayer=L.layerGroup(res.bdata.buildings.map(bb=>
+      L.circleMarker([bb.lat,bb.lon],{radius:Math.max(2,Math.sqrt(bb.area_m2||50)/4),color:"#8a8a7a",weight:0.6,fillColor:"#c9c4b2",fillOpacity:0.55})
+    )).addTo(map);
+  }
+  if(res.road&&res.road.roads&&res.road.roads.length){
+    const art=new Set(["motorway","trunk","primary","secondary"]);
+    window._rLayer=L.layerGroup(res.road.roads.map(sg=>
+      L.circleMarker([sg.lat,sg.lon],{radius:art.has(sg.class)?3:1.5,color:art.has(sg.class)?"#b8860b":"#9aa5ad",weight:1,fillOpacity:0.7})
+    )).addTo(map);
+  }
   // draw serving GSP + connection on the map
   if(window._gspMark){map.removeLayer(window._gspMark);window._gspMark=null;}
   if(window._gspLine){map.removeLayer(window._gspLine);window._gspLine=null;}
