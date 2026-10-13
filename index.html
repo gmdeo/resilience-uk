@@ -320,12 +320,11 @@ function llToBNG(lat,lng){
 
 async function queryEA(lat,lng){
   const {E,N}=llToBNG(lat,lng),pad=900;
-  const url=EA_FS+"?where=1%3D1&geometry="+E+"%2C"+N+"%2C"+(E+pad)+"%2C"+(N+pad)+
-    "&geometryType=esriGeometryEnvelope&inSR=27700&spatialRel=esriSpatialRelIntersects&outFields=prob_4band,suitability&returnGeometry=false&f=json";
+  const url="/api/flood?E="+E+"&N="+N+"&pad="+pad;
   try{
     const r=await fetch(url); const j=await r.json();
-    const feats=(j.features||[]).map(f=>f.attributes);
-    return {ok:true,features:feats,source:"EA live"};
+    const feats=(j.features||[]);
+    return {ok:j.ok!==false&&feats.length>0,features:feats,source:j.source||"EA live (via proxy)"};
   }catch(e){ return {ok:false,features:[],source:"EA unreachable — modelled estimate"}; }
 }
 function summarizeFlood(feats){
