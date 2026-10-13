@@ -16,19 +16,33 @@ module.exports = async (req, res) => {
     return;
   }
   const geometry = [E, N, E + pad, N + pad].join(",");
+  // generalize polygons server-side: maxAllowableOffset (in outSR degrees) drops redundant
+  // raster-cell vertices so the response stays small enough to ship to the browser.
   const url = EA_BASE +
     "?where=1%3D1&geometry=" + encodeURIComponent(geometry) +
     "&geometryType=esriGeometryEnvelope&inSR=27700&spatialRel=esriSpatialRelIntersects" +
-    "&outFields=prob_4band,suitability&returnGeometry=true&outSR=4326&f=json";
+    "&outFields=prob_4band,suitability&returnGeometry=true&outSR=4326" +
+    "&maxAllowableOffset=0.0001&f=json";
 
   try {
     const upstream = await fetch(url, { headers: { "User-Agent": "ResilienceUK/1.0" } });
     const data = await upstream.json();
-    const feats = (data.features || []).map(f => ({
+    let feats = (data.features || []).map(f => ({
       prob_4band: f.attributes && f.attributes.prob_4band,
       suitability: f.attributes && f.attributes.suitability,
       rings: f.geometry && f.geometry.rings ? f.geometry.rings : null
     }));
+    // decimate ring vertices to keep the payload browser-safe
+    let pts = 0;
+    feats.forEach(f => { if (f.rings) f.rings.forEach(r => pts += r.length); });
+    const MAXPTS = 4000;
+    if (pts > MAXPTS) {
+      const stride = Math.ceil(pts / MAXPTS);
+      feats = feats.map(f => {
+        if (!f.rings) return f;
+        return { ...f, rings: f.rings.map(r => { const d = r.filter((_, i) => i % stride === 0); return d.length >= 3 ? d : r.slice(0, 3); }) };
+      });
+    }
     res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate");
     res.status(200).json({ ok: true, source: "EA live (via proxy)", count: feats.length, features: feats });
   } catch (e) {
